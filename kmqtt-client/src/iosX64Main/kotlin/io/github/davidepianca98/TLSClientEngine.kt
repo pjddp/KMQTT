@@ -1,8 +1,39 @@
 package io.github.davidepianca98
 
-import kotlinx.cinterop.*
+import kotlinx.cinterop.ByteVar
+import kotlinx.cinterop.COpaquePointer
+import kotlinx.cinterop.CPointer
+import kotlinx.cinterop.CPointerVar
+import kotlinx.cinterop.UByteVar
+import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
+import kotlinx.cinterop.convert
+import kotlinx.cinterop.cstr
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.pointed
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.refTo
+import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.toKString
+import kotlinx.cinterop.usePinned
+import kotlinx.cinterop.value
 import openssl.*
-import platform.posix.getenv
+import platform.CoreFoundation.CFArrayAppendValue
+import platform.CoreFoundation.CFArrayCreateMutable
+import platform.CoreFoundation.CFDataCreate
+import platform.CoreFoundation.CFRelease
+import platform.CoreFoundation.CFStringCreateWithCString
+import platform.CoreFoundation.kCFStringEncodingUTF8
+import platform.CoreFoundation.kCFTypeArrayCallBacks
+import platform.Security.SecCertificateCreateWithData
+import platform.Security.SecCertificateRef
+import platform.Security.SecPolicyCreateSSL
+import platform.Security.SecTrustCreateWithCertificates
+import platform.Security.SecTrustEvaluateWithError
+import platform.Security.SecTrustRefVar
+import platform.Security.errSecSuccess
 import platform.posix.strcpy
 import platform.posix.strlen
 import io.github.davidepianca98.socket.IOException
@@ -80,9 +111,14 @@ internal actual class TLSClientEngine actual constructor(tlsSettings: TLSClientS
                     null
                 )
             } else {
-                if (SSL_CTX_load_verify_locations(sslContext, null, getenv(X509_get_default_cert_dir_env()?.toKString())?.toKString()) != 1) {
-                    throw Exception("Server certificate path not found")
-                }
+                // iOS has no file based CA store, validate the chain against the system trust store instead
+                SSL_CTX_set_cert_verify_callback(
+                    sslContext,
+                    staticCFunction { storeContext: CPointer<X509_STORE_CTX>?, _: COpaquePointer? ->
+                        verifyWithSystemTrust(storeContext)
+                    },
+                    null
+                )
             }
         }
 
@@ -137,11 +173,43 @@ internal actual class TLSClientEngine actual constructor(tlsSettings: TLSClientS
             }
         }
 
+        tlsSettings.alpnProtocols?.let {
+            val protoBytes = it.flatMap { proto ->
+                val bytes = proto.encodeToByteArray()
+                listOf(bytes.size.toByte()) + bytes.toList()
+            }.toByteArray()
+
+            protoBytes.usePinned { pinned ->
+                val result = SSL_CTX_set_alpn_protos(
+                    sslContext,
+                    pinned.addressOf(0).reinterpret(),
+                    protoBytes.size.toUInt()
+                )
+                if (result != 0) {
+                    throw Exception("Failed to set ALPN protocols")
+                }
+            }
+        }
+
         val clientContext = SSL_new(sslContext)
         if (clientContext == null) {
             BIO_free(readBio)
             BIO_free(writeBio)
             throw IOException("Failed allocating read BIO")
+        }
+
+        tlsSettings.serverNameIndications?.let {
+            memScoped {
+                val result = SSL_ctrl(
+                    clientContext,
+                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                    TLSEXT_NAMETYPE_host_name.toLong(),
+                    it.cstr.ptr
+                )
+                if (result != 1L) {
+                    throw Exception("Failed to set SNI hostname")
+                }
+            }
         }
 
         SSL_set_verify(clientContext, SSL_VERIFY_PEER, null)
@@ -181,5 +249,76 @@ internal actual class TLSClientEngine actual constructor(tlsSettings: TLSClientS
 
     actual override fun close() {
         SSL_free(context)
+    }
+}
+
+private fun x509ToSecCertificate(certificate: CPointer<X509>): SecCertificateRef? = memScoped {
+    val length = i2d_X509(certificate, null)
+    if (length <= 0) {
+        return null
+    }
+    val buffer = allocArray<UByteVar>(length)
+    val cursor = alloc<CPointerVar<UByteVar>>()
+    cursor.value = buffer
+    if (i2d_X509(certificate, cursor.ptr) != length) {
+        return null
+    }
+    val data = CFDataCreate(null, buffer, length.convert()) ?: return null
+    val secCertificate = SecCertificateCreateWithData(null, data)
+    CFRelease(data)
+    secCertificate
+}
+
+/**
+ * Verifies the peer certificate chain with the Apple Security framework, using the system trust store and,
+ * if an SNI hostname was set, checking that the certificate matches it.
+ */
+private fun verifyWithSystemTrust(storeContext: CPointer<X509_STORE_CTX>?): Int {
+    if (storeContext == null) {
+        return 0
+    }
+    val leaf = X509_STORE_CTX_get0_cert(storeContext) ?: return 0
+
+    val ssl = X509_STORE_CTX_get_ex_data(storeContext, SSL_get_ex_data_X509_STORE_CTX_idx())?.reinterpret<SSL>()
+    val hostname = ssl?.let { SSL_get_servername(it, TLSEXT_NAMETYPE_host_name)?.toKString() }
+
+    val certificates = CFArrayCreateMutable(null, 0, kCFTypeArrayCallBacks.ptr) ?: return 0
+    val hostnameRef = hostname?.let { CFStringCreateWithCString(null, it, kCFStringEncodingUTF8) }
+    val policy = SecPolicyCreateSSL(true, hostnameRef)
+    try {
+        val chain = mutableListOf(leaf)
+        X509_STORE_CTX_get0_untrusted(storeContext)?.let { untrusted ->
+            for (i in 0..<sk_X509_num(untrusted)) {
+                val certificate = sk_X509_value(untrusted, i)
+                if (certificate != null && X509_cmp(certificate, leaf) != 0) {
+                    chain.add(certificate)
+                }
+            }
+        }
+        for (certificate in chain) {
+            val secCertificate = x509ToSecCertificate(certificate) ?: return 0
+            CFArrayAppendValue(certificates, secCertificate)
+            CFRelease(secCertificate)
+        }
+
+        val trusted = memScoped {
+            val trust = alloc<SecTrustRefVar>()
+            if (SecTrustCreateWithCertificates(certificates, policy, trust.ptr) != errSecSuccess) {
+                return@memScoped false
+            }
+            val trustRef = trust.value ?: return@memScoped false
+            val result = SecTrustEvaluateWithError(trustRef, null)
+            CFRelease(trustRef)
+            result
+        }
+        if (!trusted) {
+            X509_STORE_CTX_set_error(storeContext, X509_V_ERR_CERT_UNTRUSTED)
+            return 0
+        }
+        return 1
+    } finally {
+        policy?.let { CFRelease(it) }
+        hostnameRef?.let { CFRelease(it) }
+        CFRelease(certificates)
     }
 }
