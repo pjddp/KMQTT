@@ -37,6 +37,7 @@ import platform.Security.errSecSuccess
 import platform.posix.strcpy
 import platform.posix.strlen
 import io.github.davidepianca98.socket.IOException
+import io.github.davidepianca98.socket.SocketClosedException
 import io.github.davidepianca98.socket.tls.TLSClientSettings
 import io.github.davidepianca98.socket.tls.TLSEngine
 
@@ -45,6 +46,13 @@ internal actual class TLSClientEngine actual constructor(tlsSettings: TLSClientS
     private val context: CPointer<SSL>
     private val readBio: CPointer<BIO>
     private val writeBio: CPointer<BIO>
+    private var closed = false
+
+    private fun ensureOpen() {
+        if (closed) {
+            throw SocketClosedException()
+        }
+    }
 
     fun loadServerCertsFromString(context: CPointer<SSL_CTX>, certBuffer: String): Boolean {
         val bio = BIO_new(BIO_s_mem())
@@ -222,32 +230,47 @@ internal actual class TLSClientEngine actual constructor(tlsSettings: TLSClientS
     }
 
     actual override val isInitFinished: Boolean
-        get() = SSL_is_init_finished(context) != 0
+        get() {
+            ensureOpen()
+            return SSL_is_init_finished(context) != 0
+        }
 
     actual override val bioShouldRetry: Boolean
-        get() = BIO_test_flags(writeBio, BIO_FLAGS_SHOULD_RETRY) == 0
+        get() {
+            ensureOpen()
+            return BIO_test_flags(writeBio, BIO_FLAGS_SHOULD_RETRY) == 0
+        }
 
     actual override fun write(buffer: CPointer<ByteVar>, length: Int): Int {
+        ensureOpen()
         return SSL_write(context, buffer, length)
     }
 
     actual override fun read(buffer: CPointer<ByteVar>, length: Int): Int {
+        ensureOpen()
         return SSL_read(context, buffer, length)
     }
 
     actual override fun bioRead(buffer: CPointer<ByteVar>, length: Int): Int {
+        ensureOpen()
         return BIO_read(writeBio, buffer, length)
     }
 
     actual override fun bioWrite(buffer: CPointer<ByteVar>, length: Int): Int {
+        ensureOpen()
         return BIO_write(readBio, buffer, length)
     }
 
     actual override fun getError(result: Int): Int {
+        ensureOpen()
         return SSL_get_error(context, result)
     }
 
     actual override fun close() {
+        if (closed) {
+            return
+        }
+        closed = true
         SSL_free(context)
     }
 }
